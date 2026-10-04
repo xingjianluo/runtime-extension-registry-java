@@ -6,6 +6,8 @@ import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.Chang
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ChangeOutcome;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ChangeSet;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ExtensionStatusView;
+import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.HistoryPage;
+import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.HistoryVersion;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.RegistrySnapshot;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.registry.ExtensionRegistry;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.spi.ExtensionInvocation;
@@ -25,6 +27,9 @@ import java.util.Map;
  *   <li>{@code GET  /api/extensions}：当前世代快照（全部扩展状态与配置）</li>
  *   <li>{@code POST /api/extensions/changes}：提交一批原子变更（启停/配置/移除）</li>
  *   <li>{@code POST /api/extensions/{id}/invoke}：在当前世代执行某扩展</li>
+ *   <li>{@code GET  /api/extensions/history}：历史版本列表（编号/类型/差异扩展）</li>
+ *   <li>{@code GET  /api/extensions/history/{version}}：取某历史版本（含差异与完整快照）</li>
+ *   <li>{@code POST /api/extensions/history/{version}/rollback}：原子回退到某历史版本</li>
  * </ul>
  * 新扩展的注册（携带工厂）仅开放编程式 API；HTTP 仅覆盖运行时热更新操作。
  */
@@ -76,6 +81,27 @@ public class ExtensionController {
         log.info("invoke received: extensionId={}, inputKeys={}",
                 id, input == null ? null : input.keySet());
         return registry.invoke(new ExtensionInvocation(id, input));
+    }
+
+    @GetMapping("/history")
+    public HistoryPage history() {
+        return registry.history();
+    }
+
+    @GetMapping("/history/{version}")
+    public HistoryVersion historyVersion(@PathVariable long version) {
+        log.info("history version query: version={}", version);
+        // 不存在或已被保留上限淘汰，统一归一化为 404 HISTORY_VERSION_NOT_FOUND（不返回空、不报 500）。
+        return registry.historyVersion(version)
+                .orElseThrow(() -> new ExtensionException(ErrorCode.HISTORY_VERSION_NOT_FOUND,
+                        "history version not found or already evicted: " + version,
+                        Map.of("version", version)));
+    }
+
+    @PostMapping("/history/{version}/rollback")
+    public ChangeOutcome rollback(@PathVariable long version) {
+        log.info("rollback request received: targetVersion={}", version);
+        return registry.rollback(version);
     }
 
     private static ChangeCommand toCommand(ChangeRequest request) {

@@ -81,7 +81,7 @@ public class ApiExceptionHandler {
 
     private static HttpStatus statusOf(ErrorCode code) {
         return switch (code) {
-            case EXTENSION_NOT_FOUND -> HttpStatus.NOT_FOUND;
+            case EXTENSION_NOT_FOUND, HISTORY_VERSION_NOT_FOUND -> HttpStatus.NOT_FOUND;
             case BAD_REQUEST -> HttpStatus.BAD_REQUEST;
             case EXECUTION_FAILED -> HttpStatus.BAD_GATEWAY;
             case INTERNAL_ERROR -> HttpStatus.INTERNAL_SERVER_ERROR;

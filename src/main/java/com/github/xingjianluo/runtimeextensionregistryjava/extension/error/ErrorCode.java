@@ -12,6 +12,10 @@ public enum ErrorCode {
     INCOMPATIBLE_DEPENDENCY_VERSION,
     /** 依赖图中存在环。 */
     CYCLIC_DEPENDENCY,
+    /** 请求的历史版本不存在，或已因超出保留上限被淘汰。 */
+    HISTORY_VERSION_NOT_FOUND,
+    /** 回退目标版本与当前已注册扩展集合/当前依赖兼容关系不一致，回退被整体拒绝。 */
+    ROLLBACK_NOT_POSSIBLE,
     /** 请求的扩展标识不存在。 */
     EXTENSION_NOT_FOUND,
     /** 扩展已停用。 */
