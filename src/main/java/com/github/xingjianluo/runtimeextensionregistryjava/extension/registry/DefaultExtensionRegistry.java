@@ -6,7 +6,10 @@ import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.Chang
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ChangeOutcome;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ChangeSet;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ExtensionDefinition;
+import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ExtensionChange;
+import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ExtensionStateSnapshot;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ExtensionStatusView;
+import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.HistoryVersion;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.RegistrySnapshot;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.spi.Extension;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.spi.ExtensionContext;
@@ -79,6 +82,47 @@ public class DefaultExtensionRegistry implements ExtensionRegistry {
     private final Object writeLock = new Object();
     private volatile Generation current = new Generation(0, Map.of());
 
+    /** 历史版本保留上限（可配，>=1）。 */
+    private final int maxHistoryVersions;
+
+    /** 历史版本表：编号 -> 版本；不可变 COW 发布，读路径无锁。 */
+    private volatile Map<Long, HistoryVersion> history = java.util.Collections.unmodifiableMap(new LinkedHashMap<>());
+
+    /** 测试与默认装配用：默认保留 20 个历史版本。 */
+    public DefaultExtensionRegistry() {
+        this(20);
+    }
+
+    /**
+     * @param maxHistoryVersions 历史版本保留上限，超出后按最旧先淘汰；必须 &gt;= 1
+     */
+    @org.springframework.beans.factory.annotation.Autowired
+    public DefaultExtensionRegistry(
+            @org.springframework.beans.factory.annotation.Value("${registry.history.max-versions:20}")
+            int maxHistoryVersions) {
+        if (maxHistoryVersions < 1) {
+            throw new IllegalArgumentException("maxHistoryVersions must be >= 1: " + maxHistoryVersions);
+        }
+        this.maxHistoryVersions = maxHistoryVersions;
+    }
+
+    @Override
+    public List<HistoryVersion> history() {
+        // 已发布的不可变映射，按编号升序（LinkedHashMap 插入序即编号序）。
+        return List.copyOf(history.values());
+    }
+
+    @Override
+    public HistoryVersion historyVersion(long number) {
+        HistoryVersion version = history.get(number);
+        if (version == null) {
+            throw new ExtensionException(ErrorCode.VERSION_NOT_FOUND,
+                    "history version not found (never existed or already evicted): " + number,
+                    Map.of("version", number));
+        }
+        return version;
+    }
+
     @Override
     public ChangeOutcome apply(ChangeSet changeSet) {
         Objects.requireNonNull(changeSet, "changeSet");
@@ -89,53 +133,126 @@ public class DefaultExtensionRegistry implements ExtensionRegistry {
         }
 
         synchronized (writeLock) {
-            Generation old = current;
-
-            log.info("apply change set start: generation={}, commands={}", old.number(), summarize(commands));
-
-            // 1. 在副本上按序应用命令，构建本次候选定义表（含 enabled 标记）。
-            Map<String, ExtensionDefinition> candidates = new LinkedHashMap<>();
-            Map<String, Boolean> enabledFlags = new HashMap<>();
-            for (Entry entry : old.entries().values()) {
-                candidates.put(entry.definition().id(), entry.definition());
-                enabledFlags.put(entry.definition().id(), entry.enabled());
-            }
-            for (ChangeCommand command : commands) {
-                applyCommand(command, candidates, enabledFlags);
-            }
-
-            // 2. 依赖校验：范围解析、缺失、版本不兼容、循环依赖（失败即整体拒绝）。
-            DependencyResolver.Resolved resolved = DependencyResolver.resolve(candidates);
-
-            // 3. 按拓扑序初始化需要初始化的扩展；可复用的实例直接进入新世代。
-            Map<String, Entry> built = new LinkedHashMap<>();
-            // 仅"本次新建/重建"的实例进 rollback 列表；旧实例绝不能在回滚中被关闭。
-            List<Entry> createdInThisChange = new ArrayList<>();
-            try {
-                for (String id : resolved.topologicalOrder()) {
-                    buildEntry(id, candidates.get(id), enabledFlags.getOrDefault(id, false),
-                            old, built, createdInThisChange);
+            log.info("apply change set start: generation={}, commands={}",
+                    current.number(), summarize(commands));
+            return commitLocked((candidates, enabledFlags) -> {
+                for (ChangeCommand command : commands) {
+                    applyCommand(command, candidates, enabledFlags);
                 }
-            } catch (RuntimeException failure) {
-                // 整体回滚：仅丢弃本次新建实例；旧世代与旧实例完全不动，对外保持可用。
-                shutdownQuietly(createdInThisChange);
-                log.warn("apply change set rejected, rolled back: generation={}, reason={}",
-                        old.number(), failure.getMessage());
-                throw failure;
-            }
-
-            // 4. 单一引用赋值，原子生效。
-            Generation next = new Generation(old.number() + 1, Map.copyOf(built));
-            current = next;
-
-            // 5. 切换完成后关闭不再被新世代沿用的旧实例。
-            shutdownObsolete(old, next);
-
-            RegistrySnapshot snapshot = toSnapshot(next);
-            log.info("apply change set committed: newGeneration={}, extensionCount={}",
-                    next.number(), next.entries().size());
-            return new ChangeOutcome(next.number(), snapshot);
+            });
         }
+    }
+
+    @Override
+    public ChangeOutcome rollback(long number) {
+        synchronized (writeLock) {
+            HistoryVersion target = history.get(number);
+            if (target == null) {
+                throw new ExtensionException(ErrorCode.VERSION_NOT_FOUND,
+                        "cannot rollback, history version not found (never existed or already evicted): "
+                                + number,
+                        Map.of("version", number));
+            }
+            log.info("rollback start: targetVersion={}, currentGeneration={}, targetState={}",
+                    number, current.number(),
+                    target.extensions().stream()
+                            .map(s -> s.id() + "(enabled=" + s.enabled() + ")").toList());
+            try {
+                return commitLocked((candidates, enabledFlags) -> {
+                    // 目标版本引用的扩展必须全部仍已注册：回退不复活已移除的扩展。
+                    List<String> missing = new ArrayList<>();
+                    for (ExtensionStateSnapshot state : target.extensions()) {
+                        if (!candidates.containsKey(state.id())) {
+                            missing.add(state.id());
+                        }
+                    }
+                    if (!missing.isEmpty()) {
+                        throw new ExtensionException(ErrorCode.ROLLBACK_REJECTED,
+                                "rollback rejected: target version " + number
+                                        + " references extensions no longer registered: " + missing,
+                                Map.of("version", number,
+                                        "reason", "EXTENSIONS_NO_LONGER_REGISTERED",
+                                        "missingExtensions", missing.toString()));
+                    }
+                    // 仅恢复运行状态（启停 + 配置）；版本/依赖声明/工厂以当前注册为准，
+                    // 随后仍会走与 apply 完全相同的依赖校验与隔离初始化。
+                    for (ExtensionStateSnapshot state : target.extensions()) {
+                        ExtensionDefinition cur = candidates.get(state.id());
+                        candidates.put(state.id(), new ExtensionDefinition(
+                                cur.id(), cur.version(), cur.dependencies(), cur.enabled(),
+                                Map.copyOf(state.config()), cur.factory()));
+                        enabledFlags.put(state.id(), state.enabled());
+                    }
+                });
+            } catch (ExtensionException failure) {
+                if (failure.code() == ErrorCode.ROLLBACK_REJECTED) {
+                    throw failure;
+                }
+                // 依赖校验/配置校验/初始化等失败统一归一化为可区分的回退拒绝。
+                throw new ExtensionException(ErrorCode.ROLLBACK_REJECTED,
+                        "rollback to version " + number + " rejected: " + failure.getMessage(),
+                        Map.of("version", number, "reason", failure.code().name()),
+                        failure);
+            }
+        }
+    }
+
+    /** 在写锁内对候选定义表做一次变更（apply 的命令序列 / rollback 的状态恢复）。 */
+    private interface CandidateMutator {
+        void mutate(Map<String, ExtensionDefinition> candidates, Map<String, Boolean> enabledFlags);
+    }
+
+    /**
+     * 原子提交流水线（调用方必须持有写锁）：
+     * 应用变更 → 依赖校验 → 隔离初始化 → 原子发布 → 留存历史 → 清理旧实例。
+     * 任何一步失败，已发布世代与旧实例完全不动。
+     */
+    private ChangeOutcome commitLocked(CandidateMutator mutator) {
+        Generation old = current;
+
+        // 1. 在副本上应用变更，构建本次候选定义表（含 enabled 标记）。
+        Map<String, ExtensionDefinition> candidates = new LinkedHashMap<>();
+        Map<String, Boolean> enabledFlags = new HashMap<>();
+        for (Entry entry : old.entries().values()) {
+            candidates.put(entry.definition().id(), entry.definition());
+            enabledFlags.put(entry.definition().id(), entry.enabled());
+        }
+        mutator.mutate(candidates, enabledFlags);
+
+        // 2. 依赖校验：范围解析、缺失、版本不兼容、循环依赖（失败即整体拒绝）。
+        DependencyResolver.Resolved resolved = DependencyResolver.resolve(candidates);
+
+        // 3. 按拓扑序初始化需要初始化的扩展；可复用的实例直接进入新世代。
+        Map<String, Entry> built = new LinkedHashMap<>();
+        // 仅"本次新建/重建"的实例进 rollback 列表；旧实例绝不能在回滚中被关闭。
+        List<Entry> createdInThisChange = new ArrayList<>();
+        try {
+            for (String id : resolved.topologicalOrder()) {
+                buildEntry(id, candidates.get(id), enabledFlags.getOrDefault(id, false),
+                        old, built, createdInThisChange);
+            }
+        } catch (RuntimeException failure) {
+            // 整体回滚：仅丢弃本次新建实例；旧世代与旧实例完全不动，对外保持可用。
+            shutdownQuietly(createdInThisChange);
+            log.warn("change rejected, rolled back: generation={}, reason={}",
+                    old.number(), failure.getMessage());
+            throw failure;
+        }
+
+        // 4. 单一引用赋值，原子生效。
+        Generation next = new Generation(old.number() + 1, Map.copyOf(built));
+        current = next;
+
+        // 5. 留存历史版本（含相对上一版本的逐项变更），超出保留上限淘汰最旧。
+        recordHistory(old, next);
+
+        // 6. 切换完成后关闭不再被新世代沿用的旧实例。
+        shutdownObsolete(old, next);
+
+        RegistrySnapshot snapshot = toSnapshot(next);
+        log.info("change committed: newGeneration={}, extensionCount={}",
+                next.number(), next.entries().size());
+        return new ChangeOutcome(next.number(), snapshot);
     }
 
     @Override
@@ -365,6 +482,90 @@ public class DefaultExtensionRegistry implements ExtensionRegistry {
         return Objects.equals(a.version(), b.version())
                 && Objects.equals(a.dependencies(), b.dependencies())
                 && Objects.equals(a.config(), b.config());
+    }
+
+    // ------------------------------------------------------------------
+    // 历史版本：留存、diff 与淘汰（仅在写锁内、成功提交后调用）
+    // ------------------------------------------------------------------
+
+    private void recordHistory(Generation old, Generation next) {
+        HistoryVersion version = new HistoryVersion(
+                next.number(),
+                List.copyOf(diff(old, next)),
+                List.copyOf(stateSnapshots(next)));
+
+        Map<Long, HistoryVersion> updated = new LinkedHashMap<>(history);
+        updated.put(version.number(), version);
+        // 超出保留上限：按最旧的先淘汰（插入序即编号序）。
+        while (updated.size() > maxHistoryVersions) {
+            Long oldest = updated.keySet().iterator().next();
+            updated.remove(oldest);
+            log.info("history version evicted (retention={}): number={}", maxHistoryVersions, oldest);
+        }
+        history = java.util.Collections.unmodifiableMap(updated);
+        log.info("history version recorded: number={}, changes={}, retained={}",
+                version.number(), summarizeChanges(version.changes()), updated.size());
+    }
+
+    /** 逐项对比两个世代，产出可读的变更清单（启停、配置、注册/移除/重定义）。 */
+    private static List<ExtensionChange> diff(Generation old, Generation next) {
+        List<ExtensionChange> changes = new ArrayList<>();
+        for (Entry newEntry : next.entries().values()) {
+            String id = newEntry.definition().id();
+            Entry oldEntry = old.entries().get(id);
+            if (oldEntry == null) {
+                changes.add(new ExtensionChange(id, ExtensionChange.ChangeKind.REGISTERED,
+                        null, Map.copyOf(newEntry.definition().config())));
+                continue;
+            }
+            ExtensionDefinition oldDef = oldEntry.definition();
+            ExtensionDefinition newDef = newEntry.definition();
+            if (!Objects.equals(oldDef.version(), newDef.version())
+                    || !Objects.equals(oldDef.dependencies(), newDef.dependencies())) {
+                changes.add(new ExtensionChange(id, ExtensionChange.ChangeKind.REDEFINED, null, null));
+            }
+            if (oldEntry.enabled() != newEntry.enabled()) {
+                changes.add(new ExtensionChange(id,
+                        newEntry.enabled() ? ExtensionChange.ChangeKind.ENABLED
+                                : ExtensionChange.ChangeKind.DISABLED,
+                        null, null));
+            }
+            if (!Objects.equals(oldDef.config(), newDef.config())) {
+                changes.add(new ExtensionChange(id, ExtensionChange.ChangeKind.CONFIG_CHANGED,
+                        Map.copyOf(oldDef.config()), Map.copyOf(newDef.config())));
+            }
+        }
+        for (Entry oldEntry : old.entries().values()) {
+            String id = oldEntry.definition().id();
+            if (!next.entries().containsKey(id)) {
+                changes.add(new ExtensionChange(id, ExtensionChange.ChangeKind.REMOVED,
+                        Map.copyOf(oldEntry.definition().config()), null));
+            }
+        }
+        return changes;
+    }
+
+    /** 把一个世代的全部条目转成可留存的只读状态（不含实例与工厂）。 */
+    private static List<ExtensionStateSnapshot> stateSnapshots(Generation generation) {
+        List<ExtensionStateSnapshot> states = new ArrayList<>();
+        for (Entry entry : generation.entries().values()) {
+            Map<String, String> deps = new LinkedHashMap<>();
+            entry.definition().dependencies()
+                    .forEach(req -> deps.put(req.extensionId(), req.versionRangeRaw()));
+            states.add(new ExtensionStateSnapshot(
+                    entry.definition().id(),
+                    entry.definition().version().toString(),
+                    entry.enabled(),
+                    Map.copyOf(deps),
+                    Map.copyOf(entry.definition().config())));
+        }
+        return states;
+    }
+
+    private static List<String> summarizeChanges(List<ExtensionChange> changes) {
+        return changes.stream()
+                .map(change -> change.kind() + "(" + change.extensionId() + ")")
+                .toList();
     }
 
     // ------------------------------------------------------------------

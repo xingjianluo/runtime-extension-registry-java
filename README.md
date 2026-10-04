@@ -17,16 +17,20 @@
 mvn test
 ```
 
-共 32 个用例，包含：
+共 46 个用例，包含：
 
 | 测试类 | 覆盖内容 |
 | --- | --- |
 | `VersionRangeTest` | 语义化版本解析、精确版本与区间兼容判定、非法表达式拒绝 |
 | `DependencyResolutionTest` | 重复标识、依赖缺失、版本不兼容、非法范围、直接/传递循环依赖的可区分拒绝 |
 | `HotReloadRollbackTest` | 配置热更新原子替换、未受影响扩展不重复初始化、无效配置/初始化失败回滚、启停、批次 all-or-nothing、依赖未就绪拒绝执行 |
+| `HistoryVersionTest` | 历史版本递增编号、逐项 diff（启停/配置/注册/移除/重定义）、被拒变更不留存、保留上限与最旧淘汰边界、已淘汰/从未存在版本的 `VERSION_NOT_FOUND` |
+| `RollbackTest` | 回退成功后状态与目标一致并生成更新编号、原历史不被覆盖、未受影响扩展不重复初始化、目标含已移除扩展/按当前定义无法初始化时 `ROLLBACK_REJECTED` 且当前状态原样可用、反复回退再改稳定收敛 |
+| `ConcurrentRollbackTest` | 回退与热更新/读取同一时间窗口真实交错（5 轮重复）：无撕裂、时间窗口重叠可证、读者能观察到回退态与写入态、初始化/关闭严格成对、世代号与成功变更数精确对账 |
 | `ConcurrentUpdateTest` | 6 写 4 读并发：无撕裂状态、初始化次数精确、被拒变更期间持续可用、读者观察到多个已提交世代 |
 | `FailureIsolationTest` | 单扩展执行失败不影响其他扩展、错误码与上下文、初始化失败整批回滚 |
 | `WebApiIntegrationTest` | 端到端 HTTP：热更新、拒绝回滚、错误归一化响应不含堆栈 |
+| `HistoryApiIntegrationTest` | 端到端 HTTP：历史列表/按号查询（含 diff）、回退恢复状态并追加新编号、查不到版本返回 404 `VERSION_NOT_FOUND` |
 
 单测日志会打印**输入配置与判定依据**，例如：
 `change request received: action=update-config, extensionId=transform, enabled=null, configKeys=[mode]`、
@@ -185,7 +189,82 @@ registry.apply(new ChangeSet(List.of(new ChangeCommand.RegisterDefinition(def)))
 
 ---
 
-## 5. 错误归一化与故障隔离
+## 5. 历史版本与一键回退
+
+在世代机制之上，每次**成功提交**（包括回退本身）都会把生效后的运行状态留存为一个
+**历史版本**；被拒绝的变更不留存、不占用编号。
+
+### 5.1 历史版本语义
+
+- **编号**：历史版本号即该次提交产生的世代号，严格递增、只增不减；回退提交同样生成
+  一个比当前更新的新编号，**已有历史版本永远不被覆盖**。
+- **内容**：每个历史版本包含
+  - `changes`：本版本相对上一留存版本的逐项变更，种类有
+    `REGISTERED / REMOVED / ENABLED / DISABLED / CONFIG_CHANGED / REDEFINED`
+    （配置变更携带前后值，可直接看出"这次动了谁的启停和配置"）；
+  - `extensions`：该版本生效后的完整运行状态（每个扩展的标识、版本、启停、依赖声明、配置；
+    不含实例与工厂）。
+- **查询**：`GET /api/extensions/history` 列表（按编号升序）、
+  `GET /api/extensions/history/{number}` 按号查询。
+  查一个**已被淘汰或从未存在**的编号，返回 404 `VERSION_NOT_FOUND`——
+  是明确的"查不到"，不是空结果，也不是内部错误。
+
+### 5.2 保留与淘汰
+
+- 保留条数可配：`registry.history.max-versions`（默认 `20`，必须 ≥ 1；
+  编程式装配可用 `new DefaultExtensionRegistry(maxHistoryVersions)`）。
+- 超出上限时**按最旧的先淘汰**；淘汰只影响"还能查/回退多远"，不影响当前生效状态。
+
+### 5.3 回退语义
+
+`POST /api/extensions/history/{number}/rollback`（编程式：`registry.rollback(number)`）
+把指定历史版本的**启停状态与配置**恢复为对外生效状态：
+
+- 回退本身是一次原子变更，走与 `apply` 完全相同的流水线（依赖校验 → 隔离初始化 →
+  原子发布）：**要么全部生效、要么全部作废**；成功后生成更新编号的历史版本。
+- 回退只恢复运行状态（启停 + 配置）；扩展的**版本、依赖声明、工厂以当前注册为准**，
+  不会复活旧定义。目标版本里**现在仍注册**的扩展逐一恢复；目标版本之后新注册的扩展不受影响。
+- 未受回退影响的扩展**不重复初始化**（复用判定与热更新一致）；被替换的旧实例在新世代
+  发布后才关闭，初始化次数与成功变更次数严格对得上。
+- 并发性质与热更新一致：回退与其它变更在写锁内串行，读取无锁且始终落在某一完整世代，
+  任何时刻读到的要么是完整旧状态、要么是完整新状态。
+
+### 5.4 回退被拒的边界情况
+
+| 情况 | 错误码 | 说明 |
+| --- | --- | --- |
+| 目标编号从未产生或已被淘汰 | `VERSION_NOT_FOUND`（404） | 与"目标存在但不可用"明确区分 |
+| 目标版本包含**现在已经不存在**的扩展 | `ROLLBACK_REJECTED`（409），context `reason=EXTENSIONS_NO_LONGER_REGISTERED` 并列出 `missingExtensions` | 回退不复活已移除的扩展 |
+| 目标配置/启停按**当前**定义与依赖关系无法通过校验或初始化（如扩展被以更严格的工厂重新注册） | `ROLLBACK_REJECTED`（409），context `reason` 给出底层原因（如 `INVALID_CONFIG`、`INCOMPATIBLE_DEPENDENCY_VERSION`） | 与普通变更失败可区分 |
+
+无论哪种拒绝：**当前正在对外提供的状态原样可用**，世代号不推进、不产生新历史版本、
+旧实例不被触碰，绝不只回退一半。
+
+### 5.5 与现有能力的兼容关系
+
+- 历史留存对 `apply` 完全透明：所有既有命令（启停/配置/注册/移除）语义不变，
+  只是每次成功提交多留一条历史。
+- 回退与热更新共用同一条原子提交流水线与同一把写锁，错误归一化、故障隔离、
+  无锁读取等性质完全一致。
+- HTTP 层新增三个端点，既有端点行为不变。
+
+本地验证：
+
+```bash
+mvn test          # HistoryVersionTest / RollbackTest / ConcurrentRollbackTest / HistoryApiIntegrationTest
+
+# 或启动应用后手动验证
+curl -s localhost:8080/api/extensions/history
+curl -s -X POST localhost:8080/api/extensions/changes -H 'Content-Type: application/json' \
+  -d '[{"action":"update-config","extensionId":"transform","config":{"mode":"LOWER"}}]'
+curl -s localhost:8080/api/extensions/history/2          # 查看该次变更的 diff
+curl -s -X POST localhost:8080/api/extensions/history/1/rollback   # 一键回到播种后的状态
+curl -s localhost:8080/api/extensions/history/999        # 404 VERSION_NOT_FOUND
+```
+
+---
+
+## 6. 错误归一化与故障隔离
 
 对外只有 `ApiError` 一种错误体：`{code, message, context}`，**不含堆栈、不含底层异常原文**。
 错误原文与 cause 链只写入服务端日志。
@@ -204,6 +283,8 @@ registry.apply(new ChangeSet(List.of(new ChangeCommand.RegisterDefinition(def)))
 | `INITIALIZATION_FAILED` | 409 | 初始化抛非校验类异常（响应剥离内部 detail） |
 | `EXECUTION_FAILED` | 502 | 执行抛异常（context 含 extensionId/generation，隔离于其他扩展） |
 | `BAD_REQUEST` | 400 | 请求体/action/入参非法 |
+| `VERSION_NOT_FOUND` | 404 | 查询/回退的历史版本从未产生或已被淘汰 |
+| `ROLLBACK_REJECTED` | 409 | 回退目标存在但无法整体生效（含已移除扩展或按当前定义无法就绪），当前状态未变 |
 | `INTERNAL_ERROR` | 500 | 兜底未归类错误，不透出任何内部信息 |
 
 故障隔离边界：扩展执行在注册表线程内同步进行，异常被捕获并归一化；
@@ -211,7 +292,7 @@ registry.apply(new ChangeSet(List.of(new ChangeCommand.RegisterDefinition(def)))
 
 ---
 
-## 6. HTTP API
+## 7. HTTP API
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -219,6 +300,9 @@ registry.apply(new ChangeSet(List.of(new ChangeCommand.RegisterDefinition(def)))
 | `GET /api/extensions/{id}` | 单个扩展状态视图，不存在返回 404 |
 | `POST /api/extensions/changes` | 提交一批原子变更（数组，all-or-nothing），返回新生效世代与快照 |
 | `POST /api/extensions/{id}/invoke` | 在当前世代执行扩展，返回 `{generation, extensionId, data}` |
+| `GET /api/extensions/history` | 留存的历史版本列表（按编号升序，含逐项变更与完整状态） |
+| `GET /api/extensions/history/{number}` | 按编号查询历史版本；已淘汰/从未存在返回 404 `VERSION_NOT_FOUND` |
+| `POST /api/extensions/history/{number}/rollback` | 一键回退到指定历史版本（原子变更）；无法整体生效返回 409 `ROLLBACK_REJECTED` |
 
 变更请求体字段：
 
@@ -236,15 +320,16 @@ registry.apply(new ChangeSet(List.of(new ChangeCommand.RegisterDefinition(def)))
 
 ---
 
-## 7. 代码地图
+## 8. 代码地图
 
 ```
 extension/
 ├── model/        Version, VersionRange, ExtensionDefinition, DependencyRequirement,
-│                 ChangeCommand(sealed), ChangeSet, RegistrySnapshot, ExtensionStatusView, ChangeOutcome
+│                 ChangeCommand(sealed), ChangeSet, RegistrySnapshot, ExtensionStatusView, ChangeOutcome,
+│                 HistoryVersion, ExtensionChange, ExtensionStateSnapshot（历史版本与逐项变更）
 ├── spi/          Extension, ExtensionFactory, ExtensionContext, ExtensionInvocation, ExtensionResult
 ├── error/        ErrorCode, ExtensionException（唯一对外异常形态）
-├── registry/     ExtensionRegistry（接口）, DefaultExtensionRegistry（世代+COW+写锁）,
+├── registry/     ExtensionRegistry（接口）, DefaultExtensionRegistry（世代+COW+写锁+历史留存/回退）,
 │                 DependencyResolver（范围/缺失/兼容/环校验 + 拓扑序）
 ├── web/          ExtensionController, ApiExceptionHandler, ApiError, ChangeRequest
 └── sample/       EchoExtension, TransformExtension, StrictConfigExtension, SampleRegistrySeeder

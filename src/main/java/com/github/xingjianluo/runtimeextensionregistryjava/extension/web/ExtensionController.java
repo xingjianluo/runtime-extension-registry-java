@@ -6,6 +6,7 @@ import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.Chang
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ChangeOutcome;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ChangeSet;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.ExtensionStatusView;
+import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.HistoryVersion;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.model.RegistrySnapshot;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.registry.ExtensionRegistry;
 import com.github.xingjianluo.runtimeextensionregistryjava.extension.spi.ExtensionInvocation;
@@ -76,6 +77,23 @@ public class ExtensionController {
         log.info("invoke received: extensionId={}, inputKeys={}",
                 id, input == null ? null : input.keySet());
         return registry.invoke(new ExtensionInvocation(id, input));
+    }
+
+    @GetMapping("/history")
+    public List<HistoryVersion> history() {
+        return registry.history();
+    }
+
+    @GetMapping("/history/{number}")
+    public HistoryVersion historyVersion(@PathVariable long number) {
+        // 不存在或已淘汰由全局处理器归一化为 404 VERSION_NOT_FOUND。
+        return registry.historyVersion(number);
+    }
+
+    @PostMapping("/history/{number}/rollback")
+    public ChangeOutcome rollback(@PathVariable long number) {
+        log.info("rollback request received: targetVersion={}", number);
+        return registry.rollback(number);
     }
 
     private static ChangeCommand toCommand(ChangeRequest request) {

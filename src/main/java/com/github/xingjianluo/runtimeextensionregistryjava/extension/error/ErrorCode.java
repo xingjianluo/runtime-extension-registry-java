@@ -26,6 +26,10 @@ public enum ErrorCode {
     EXECUTION_FAILED,
     /** 请求内容不合法。 */
     BAD_REQUEST,
+    /** 查询或回退的历史版本不存在（从未产生或已被淘汰）。 */
+    VERSION_NOT_FOUND,
+    /** 回退目标版本存在，但按当前注册与依赖关系无法整体生效，已整体拒绝。 */
+    ROLLBACK_REJECTED,
     /** 未归类的内部错误（不向调用方透出堆栈）。 */
     INTERNAL_ERROR
 }
