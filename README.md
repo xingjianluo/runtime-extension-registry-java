@@ -27,6 +27,8 @@ mvn test
 | `HistoryVersionTest` | 历史版本递增编号、逐项 diff（启停/配置/注册/移除/重定义）、被拒变更不留存、保留上限与最旧淘汰边界、已淘汰/从未存在版本的 `VERSION_NOT_FOUND` |
 | `RollbackTest` | 回退成功后状态与目标一致并生成更新编号、原历史不被覆盖、未受影响扩展不重复初始化、目标含已移除扩展/按当前定义无法初始化时 `ROLLBACK_REJECTED` 且当前状态原样可用、反复回退再改稳定收敛 |
 | `ConcurrentRollbackTest` | 回退与热更新/读取同一时间窗口真实交错（5 轮重复）：无撕裂、时间窗口重叠可证、读者能观察到回退态与写入态、初始化/关闭严格成对、世代号与成功变更数精确对账 |
+| `RollbackPostTargetRegistrationTest` | 目标版本之后新注册了扩展时的回退：成功后对外集合/启停/配置与目标逐项一致、额外扩展退出且实例成对关闭；目标内扩展当前依赖额外扩展时 `ROLLBACK_REJECTED`（reason 可区分）且当前状态原样可用、历史不推进；反复"注册额外扩展→回退"收敛到同一状态 |
+| `ConcurrentRollbackPostRegistrationTest` | 回退（移除额外扩展）与热更新/重注册/读取同一时间窗口真实交错（5 轮重复）：无撕裂、无"半个扩展"（额外扩展要么完整可见要么完全不存在）、窗口重叠可证、世代号与成功变更数精确对账 |
 | `ConcurrentUpdateTest` | 6 写 4 读并发：无撕裂状态、初始化次数精确、被拒变更期间持续可用、读者观察到多个已提交世代 |
 | `FailureIsolationTest` | 单扩展执行失败不影响其他扩展、错误码与上下文、初始化失败整批回滚 |
 | `WebApiIntegrationTest` | 端到端 HTTP：热更新、拒绝回滚、错误归一化响应不含堆栈 |
@@ -218,13 +220,17 @@ registry.apply(new ChangeSet(List.of(new ChangeCommand.RegisterDefinition(def)))
 ### 5.3 回退语义
 
 `POST /api/extensions/history/{number}/rollback`（编程式：`registry.rollback(number)`）
-把指定历史版本的**启停状态与配置**恢复为对外生效状态：
+把对外生效状态整体恢复为指定历史版本留存的状态：
 
 - 回退本身是一次原子变更，走与 `apply` 完全相同的流水线（依赖校验 → 隔离初始化 →
   原子发布）：**要么全部生效、要么全部作废**；成功后生成更新编号的历史版本。
-- 回退只恢复运行状态（启停 + 配置）；扩展的**版本、依赖声明、工厂以当前注册为准**，
-  不会复活旧定义。目标版本里**现在仍注册**的扩展逐一恢复；目标版本之后新注册的扩展不受影响。
-- 未受回退影响的扩展**不重复初始化**（复用判定与热更新一致）；被替换的旧实例在新世代
+- **回退成功后，对外可见状态与目标版本逐项一致**：可见的扩展集合、每个扩展的启停与
+  配置都和目标版本完全对齐，不多也不少。扩展的**版本、依赖声明、工厂以当前注册为准**，
+  不会复活旧定义。
+- **目标版本之后才注册的扩展**：随回退一并退出对外状态（等价于在该次回退提交中被移除，
+  回退产生的历史 diff 里体现为 `REMOVED`），其旧实例在新世代发布后关闭；之后若仍需要，
+  需通过 `apply` 重新注册。回退**不会复活**目标版本里没有、当前也未注册的扩展。
+- 未受回退影响的扩展**不重复初始化**（复用判定与热更新一致）；被替换/移除的旧实例在新世代
   发布后才关闭，初始化次数与成功变更次数严格对得上。
 - 并发性质与热更新一致：回退与其它变更在写锁内串行，读取无锁且始终落在某一完整世代，
   任何时刻读到的要么是完整旧状态、要么是完整新状态。
@@ -235,6 +241,7 @@ registry.apply(new ChangeSet(List.of(new ChangeCommand.RegisterDefinition(def)))
 | --- | --- | --- |
 | 目标编号从未产生或已被淘汰 | `VERSION_NOT_FOUND`（404） | 与"目标存在但不可用"明确区分 |
 | 目标版本包含**现在已经不存在**的扩展 | `ROLLBACK_REJECTED`（409），context `reason=EXTENSIONS_NO_LONGER_REGISTERED` 并列出 `missingExtensions` | 回退不复活已移除的扩展 |
+| 目标内扩展**当前依赖了目标版本之后才注册**的扩展（退出这些"额外"扩展会导致依赖缺失） | `ROLLBACK_REJECTED`（409），context `reason=MISSING_DEPENDENCY` | 无法保证"对外状态与目标完全一致"时整体拒绝 |
 | 目标配置/启停按**当前**定义与依赖关系无法通过校验或初始化（如扩展被以更严格的工厂重新注册） | `ROLLBACK_REJECTED`（409），context `reason` 给出底层原因（如 `INVALID_CONFIG`、`INCOMPATIBLE_DEPENDENCY_VERSION`） | 与普通变更失败可区分 |
 
 无论哪种拒绝：**当前正在对外提供的状态原样可用**，世代号不推进、不产生新历史版本、
@@ -251,7 +258,9 @@ registry.apply(new ChangeSet(List.of(new ChangeCommand.RegisterDefinition(def)))
 本地验证：
 
 ```bash
-mvn test          # HistoryVersionTest / RollbackTest / ConcurrentRollbackTest / HistoryApiIntegrationTest
+mvn test          # HistoryVersionTest / RollbackTest / RollbackPostTargetRegistrationTest
+                  # ConcurrentRollbackTest / ConcurrentRollbackPostRegistrationTest
+                  # HistoryApiIntegrationTest 等全部用例
 
 # 或启动应用后手动验证
 curl -s localhost:8080/api/extensions/history
@@ -259,6 +268,7 @@ curl -s -X POST localhost:8080/api/extensions/changes -H 'Content-Type: applicat
   -d '[{"action":"update-config","extensionId":"transform","config":{"mode":"LOWER"}}]'
 curl -s localhost:8080/api/extensions/history/2          # 查看该次变更的 diff
 curl -s -X POST localhost:8080/api/extensions/history/1/rollback   # 一键回到播种后的状态
+curl -s localhost:8080/api/extensions                    # 对外状态与目标版本逐项一致
 curl -s localhost:8080/api/extensions/history/999        # 404 VERSION_NOT_FOUND
 ```
 

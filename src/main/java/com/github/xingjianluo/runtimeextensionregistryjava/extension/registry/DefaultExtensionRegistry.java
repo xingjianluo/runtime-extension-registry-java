@@ -174,6 +174,29 @@ public class DefaultExtensionRegistry implements ExtensionRegistry {
                                         "reason", "EXTENSIONS_NO_LONGER_REGISTERED",
                                         "missingExtensions", missing.toString()));
                     }
+                    // 目标版本之后才注册的扩展必须随回退一并退出对外状态：
+                    // 回退成功后对外可见的扩展集合与目标版本完全一致，不多也不少。
+                    // 若某个目标内扩展当前依赖了这些"额外"扩展，随后的依赖校验会失败，
+                    // 由外层归一化为 ROLLBACK_REJECTED 整体拒绝，绝不只回退一半。
+                    List<String> extras = new ArrayList<>();
+                    for (String id : new ArrayList<>(candidates.keySet())) {
+                        boolean inTarget = false;
+                        for (ExtensionStateSnapshot state : target.extensions()) {
+                            if (state.id().equals(id)) {
+                                inTarget = true;
+                                break;
+                            }
+                        }
+                        if (!inTarget) {
+                            candidates.remove(id);
+                            enabledFlags.remove(id);
+                            extras.add(id);
+                        }
+                    }
+                    if (!extras.isEmpty()) {
+                        log.info("rollback to version {}: extensions registered after target "
+                                + "will leave the effective state: {}", number, extras);
+                    }
                     // 仅恢复运行状态（启停 + 配置）；版本/依赖声明/工厂以当前注册为准，
                     // 随后仍会走与 apply 完全相同的依赖校验与隔离初始化。
                     for (ExtensionStateSnapshot state : target.extensions()) {
