@@ -47,6 +47,10 @@ public interface ExtensionRegistry {
      * 回退到指定历史版本：本身是一次原子变更，成功则生成更新编号的历史版本，
      * 失败（目标含已不存在扩展、或按当前依赖与兼容关系无法就绪）整体拒绝、当前状态原样可用。
      *
+     * <p>回退成功后，对外可见的扩展集合、启停状态与配置与目标版本逐项一致：
+     * 目标版本之后才注册的扩展随回退一并移除（与状态恢复同属一次原子提交）；
+     * 扩展的版本、依赖声明与工厂始终以当前注册为准，不复活旧定义。
+     *
      * @throws com.github.xingjianluo.runtimeextensionregistryjava.extension.error.ExtensionException
      *         {@code VERSION_NOT_FOUND}（目标版本查不到）或 {@code ROLLBACK_REJECTED}（无法整体生效）
      */
